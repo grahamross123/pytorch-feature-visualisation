@@ -10,29 +10,30 @@ from copy import copy
 import numpy as np
 import cv2
 
+
 TOTAL_CONV_LAYERS = 5
 CONV_TO_LAYER = {0: 0, 1: 3, 2: 6, 3: 8, 4: 10} # Converts a given conv layer number to a total layer number in the network
+
 
 def view_feature_detectors(net, num=0):
     """
     Plot the feature detectors of a network.
     """
     print("Viewing feature detectors...")
-    for layer in net.children():
-        if isinstance(layer, nn.Sequential):
-            for layer in layer.children():
-                if isinstance(layer, nn.Conv2d):
-                    weights = layer.state_dict()["weight"]
-                    f_min, f_max = weights.min(), weights.max()
-                    filters = (weights - f_min) / (f_max - f_min)
+    for name, layer in net.named_modules():
+        if isinstance(layer, nn.Conv2d):  
+            weights = layer.state_dict()["weight"]
+            f_min, f_max = weights.min(), weights.max()
+            filters = (weights - f_min) / (f_max - f_min)
 
-                    if filters.shape[1] == 3:
-                        filt_images = filters.transpose(1, 3)
+            if filters.shape[1] == 3:
+                filt_images = filters.transpose(1, 3)
 
-                    else:
-                        filt_images = filters[:, 0, :,:]
-                    plot_grid(filt_images, title=layer, num=num)
-        break # Only view filters in first sequential layer
+            else:
+                filt_images = filters[:, 0, :,:]
+            plot_grid(filt_images, title=layer, num=num)
+            break
+        # break # Only view filters in first sequential layer
 
 
 def view_feature_maps(net, input_img, num=8):
@@ -41,10 +42,10 @@ def view_feature_maps(net, input_img, num=8):
     """
     print("Viewing feature maps...")
     # Run the input image through the network to obtain the feature outputs
-    net(input_img)
-    for layer, filter_map in net.feature_outputs.items():
+    activations = get_all_activation(net, input_img)
+    for layer, filter_map in activations.items():
         filter_map = filter_map[0, :, :].detach()
-        plot_grid(filter_map, title=net.layer_names[layer], num=num)
+        plot_grid(filter_map, title=layer, num=num)
 
 
 def activation_max(net, layer=0, neuron=0, steps=100, lr=0.1, size=100, upscaling_steps=1, upscaling_factor=1.2):
@@ -53,19 +54,21 @@ def activation_max(net, layer=0, neuron=0, steps=100, lr=0.1, size=100, upscalin
     the activation of a given neuron.
     """
     layer_num = layer
-    # input_image = torch.randn(3, 224, 224).view(1, 3, 224, 224)
     img = np.single(np.random.uniform(0,1, (3, size, size)))
     img = normalise(torch.from_numpy(img)).view(1, 3, size, size)
-    net(img)
+    activations = get_all_activation(net, img)
+    layer = layer_num_to_name(activations, layer_num)
     net.requires_grad_(False)
+    img.requires_grad_(True)
 
     def act_max_loss(activation, img):
-        pxl_inty = torch.pow((img**2).mean(), 0.5)
+        # pxl_inty = torch.pow((img**2).mean(), 0.5)
         rms = torch.pow((activation**2).mean(), 0.5)
         return -rms #+ pxl_inty
 
     loss = 0 # Set loss to 0 for initial log
     print("Activation Max: Optimising image...")
+
     for i in range(upscaling_steps):
         print(f"Upscaling step {i+1} of {upscaling_steps} | resolution {size} x {size} | loss = {round(loss.item(), 3) if loss else 0}")
         img_var = copy(img)
@@ -75,9 +78,9 @@ def activation_max(net, layer=0, neuron=0, steps=100, lr=0.1, size=100, upscalin
             net(img_var)
             optimizer.zero_grad()
             if neuron == -1:
-                loss = act_max_loss(net.feature_outputs[layer_num][0, :, :, :], img_var)
+                loss = act_max_loss(activations[layer][0, :, :, :], img_var)
             else:
-                loss = act_max_loss(net.feature_outputs[layer_num][0, neuron, :, :], img_var)
+                loss = act_max_loss(activations[layer][0, neuron, :, :], img_var)
             loss.backward()
             optimizer.step()
             img = regularise_image(img)
@@ -85,6 +88,7 @@ def activation_max(net, layer=0, neuron=0, steps=100, lr=0.1, size=100, upscalin
         size = int(upscaling_factor * size)  # calculate new image size
         img = transforms.functional.resize(img_var, (size, size))
     return img
+
 
 def regularise_image(img):
     jitter = transforms.ColorJitter(brightness=1, contrast=1, saturation=1, hue=0)
@@ -94,6 +98,7 @@ def regularise_image(img):
     img = rotation(img)
     img = blur(img)
     return img
+
 
 def view_activation_max(net, layer=0, neuron=0, steps=100, lr=0.1, size=100, upscaling_steps=1, upscaling_factor=1.2):
     img = activation_max(net, layer=layer, neuron=neuron, steps=steps, lr=lr, size=size, upscaling_steps=upscaling_steps, upscaling_factor=upscaling_factor)
@@ -188,27 +193,24 @@ def view_network_inversion(net, img_input, lr=0.1, steps=100):
     plt.show()
 
 
-def grad_cam(cnn, img):
-    pred = cnn(img)
-    print(pred.shape)
-    print(pred[:, pred.argmax(dim=1)].shape)
+def grad_cam(net, img, layer_num):
+    pred = net(img)
     pred[:, pred.argmax(dim=1)].backward()
-    gradients = cnn.gradients
-    
+    gradients = net.gradients
+    activations = get_all_activation(net, img, show_gradient=False)
+    layer = layer_num_to_name(activations, layer_num)
+    activation = activations[layer]
     pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
-    activations = cnn.feature_outputs[11]
-    for i in range(activations.shape[1]):
-        activations[:, i, :, :] *= pooled_gradients[i]
-    print(activations.shape)
-    heatmap = torch.mean(activations, dim=1).squeeze().detach()
+    for i in range(activation.shape[1]):
+        activation[:, i, :, :] *= pooled_gradients[i]
+    heatmap = torch.mean(activation, dim=1).squeeze().detach()
     heatmap = np.maximum(heatmap, 0)
     heatmap /= torch.max(heatmap)
-    print(heatmap.shape)
     return heatmap.detach().numpy()
 
 
-def view_grad_cam(cnn, img, raw_img):
-    heatmap = grad_cam(cnn, img)
+def view_grad_cam(cnn, img, raw_img, layer):
+    heatmap = grad_cam(cnn, img, layer)
     # imshow("grad cam heatmap",heatmap)
     heatmap = cv2.resize(heatmap, (raw_img.shape[0], raw_img.shape[1]))
     heatmap = np.uint8(255 * heatmap)
@@ -217,14 +219,19 @@ def view_grad_cam(cnn, img, raw_img):
     plt.show()
 
 
-def get_all_activation(net, input_img):
+def get_all_activation(net, input_img, show_gradient=False):
     """
     Retrieve a dictionary with the filter maps for each conv layer of the network
     for a specific input image using hooks.
     """
     activation = {}
-    def hook(model, input, output):
-        activation[model] = output.detach()
+    gradients = {}
+    def fwd_hook(model, input, output):
+        activation[model] = output
+
+    def bwd_hook(model, grad):
+        print(model, grad)
+        gradients[model] = grad
 
     def get_all_layers(net):
         for name, layer in net._modules.items():
@@ -233,9 +240,20 @@ def get_all_activation(net, input_img):
             if isinstance(layer, nn.Sequential):
                 get_all_layers(layer)
             elif isinstance(layer, nn.Conv2d):
-                print(layer)
                 # it's a non sequential. Register a hook
-                layer.register_forward_hook(hook)
+                layer.register_forward_hook(fwd_hook)
+                if show_gradient:
+                    layer.register_backward_hook(bwd_hook)
     get_all_layers(net)
     net(input_img)
+    if show_gradient:
+        return activation, gradients
     return activation
+
+
+def layer_num_to_name(activations, layer_num=0):
+    num = 0
+    for name, layer in activations.items():
+        if layer_num == num:
+            return name
+        num += 1
